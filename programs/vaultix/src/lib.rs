@@ -5,12 +5,15 @@ use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, Burn, MintTo};
 use anchor_spl::associated_token::AssociatedToken;
 
+
 declare_id!("6T71uU76fpMr6EBUJqjwT4T3wmuQpzj8QxnnEVv4T8cc");
 
 #[program]
 pub mod vaultix {
+
     use super::*;
 
+    // Initialize vault
     pub fn init_vault(ctx: Context<InitVault>) -> Result<()> {
         let vault_state = &mut ctx.accounts.vault_state;
         vault_state.admin = ctx.accounts.admin.key();
@@ -20,11 +23,22 @@ pub mod vaultix {
         vault_state.total_borrowed_sol = 0;
         vault_state.interest_rate = 7; // 7% interest rate for deposited SOL
         vault_state.debt_interest_rate = 10; // 10% interest rate for borrowed SOL
-        vault_state.liquidation_threshold = 75; // or some % in basis points
+        vault_state.liquidation_threshold = 90; // or some % in basis points
         vault_state.bump = ctx.bumps.vault_state;
+
+        emit!(CreateVault{
+            admin: ctx.accounts.admin.key(),
+            collateral_vault: ctx.accounts.collateral_vault.key(),
+            isol_token_mint: ctx.accounts.isol_token_mint.key(),
+            interest_rate: 7,
+            debt_interest_rate: 10,
+            liquidation_threshold: 90, 
+        });
+
         Ok(())
     }
 
+    // Initialize user position
     pub fn init_user_position(ctx: Context<InitUserPosition>) -> Result<()> {
         let user_position = &mut ctx.accounts.user_position;
         user_position.user = ctx.accounts.user.key();
@@ -68,18 +82,41 @@ pub mod vaultix {
         // Update vault state
         vault_state.total_deposited_sol = vault_state.total_deposited_sol.checked_add(amount).unwrap();
         user_position.deposited_sol = user_position.deposited_sol.checked_add(amount).unwrap();
+
+        emit!(Deposit{
+            user: user.key(),
+            amount: amount,
+        });
+
         Ok(())
     }
 
-    // pub fn add_interest(ctx: Context<AddInterest>) -> Result<()> {
+// pub fn add_interest(ctx: Context<AddInterest>) -> Result<()> {
+//     add_interest_amount(
+//         &ctx.accounts.vault_state,
+//         &mut ctx.accounts.user_position,
+//         &ctx.accounts.isol_token_mint.to_account_info(),
+//         &mut ctx.accounts.user_isol_token_account,
+//         &ctx.accounts.token_program,
+//         &ctx.accounts.vault_state.to_account_info(),
+//     )
+// }
 
-    // }
 
-    // Think about adding collateral to an escrow account or a separate vault
+    // Add collateral from user to vault(escrow)
     pub fn add_collateral(ctx: Context<AddCollateral>, amount: u64) -> Result<()> {
-        let user_position = &mut ctx.accounts.user_position;
-        let user_isol_token_account = &mut ctx.accounts.user_isol_token_account;
-        let user = &ctx.accounts.user;
+        add_interest_amount(
+        &ctx.accounts.vault_state,
+        &mut ctx.accounts.user_position,
+        &ctx.accounts.isol_token_mint.to_account_info(), 
+        &mut ctx.accounts.user_isol_token_account,
+        &ctx.accounts.token_program,
+        &ctx.accounts.vault_state.to_account_info(),
+    )?;
+
+    let user_position = &mut ctx.accounts.user_position;
+    let user_isol_token_account = &mut ctx.accounts.user_isol_token_account;
+    let user = &ctx.accounts.user;
 
     require!(user_isol_token_account.amount >= user_position.collateralized_isol_tokens + amount, ErrorCode::InsufficientCollateral);
 
@@ -93,10 +130,27 @@ pub mod vaultix {
     token::transfer(CpiContext::new(cpi_program, cpi_accounts), amount)?;
     // Increase the collateralized isol tokens
     user_position.collateralized_isol_tokens = user_position.collateralized_isol_tokens.checked_add(amount).unwrap();
+  
+    emit!(CollateralAdded{
+        user: user.key(),
+        amount: amount,
+    });
+
     Ok(())
     }
 
+    // Borrow SOL from vault
     pub fn borrow_sol(ctx: Context<BorrowSol>, amount: u64) -> Result<()> {
+
+        add_interest_amount(
+        &ctx.accounts.vault_state,
+        &mut ctx.accounts.user_position,
+        &ctx.accounts.isol_token_mint.to_account_info(), 
+        &mut ctx.accounts.user_isol_token_account,
+        &ctx.accounts.token_program,
+        &ctx.accounts.vault_state.to_account_info(),
+    )?;
+
         let user_position = &mut ctx.accounts.user_position;
         let admin_key = ctx.accounts.vault_state.admin;
             let vault_bump = ctx.accounts.vault_state.bump;
@@ -125,10 +179,26 @@ pub mod vaultix {
         user_position.borrowed_sol = user_position.borrowed_sol.checked_add(amount).unwrap();
         user_position.last_borrowed_timestamp = Clock::get()?.unix_timestamp;
 
+        emit!(BorrowedSol{
+            user: user_position.user,
+            amount: amount,
+        });
+
         Ok(())
     }
 
+    // Repay SOL to vault
     pub fn repay_sol(ctx: Context<RepaySol>, amount: u64) -> Result<()> {
+
+        add_interest_amount(
+        &ctx.accounts.vault_state,
+        &mut ctx.accounts.user_position,
+        &ctx.accounts.isol_token_mint.to_account_info(), 
+        &mut ctx.accounts.user_isol_token_account,
+        &ctx.accounts.token_program,
+        &ctx.accounts.vault_state.to_account_info(),
+    )?;
+
         let vault_state = &mut ctx.accounts.vault_state;
         let user_position = &mut ctx.accounts.user_position;
         let user = &ctx.accounts.user;
@@ -151,12 +221,26 @@ pub mod vaultix {
         vault_state.total_borrowed_sol = vault_state.total_borrowed_sol.checked_sub(amount).unwrap();
         user_position.borrowed_sol = user_position.borrowed_sol.checked_sub(amount).unwrap();
 
-        // Update user position
+        emit!(Repayed{
+            user: user.key(),
+            amount: amount,
+        });
+
         Ok(())
     }
 
-
+    // Liquidate user's position. Will be called by crank or liquidator
     pub fn liquidate(ctx: Context<Liquidate>) -> Result<()> {
+
+        add_interest_amount(
+        &ctx.accounts.vault_state,
+        &mut ctx.accounts.user_position,
+        &ctx.accounts.isol_token_mint.to_account_info(), 
+        &mut ctx.accounts.user_isol_token_account,
+        &ctx.accounts.token_program,
+        &ctx.accounts.vault_state.to_account_info(),
+    )?;
+
         let vault_state = &mut ctx.accounts.vault_state;
         let user_position = &mut ctx.accounts.user_position;
 
@@ -183,15 +267,30 @@ pub mod vaultix {
                 .borrowed_sol
                 .checked_sub(amt_to_repay)
                 .unwrap();
+            
+        emit!(Liquidated{
+            user: user_position.user,
+            amount: amt_to_repay,
+        });
         }
+
+        
+
         Ok(())
     }
 
-    // pub fn crankHealthFactor(ctx: Context<CrankHealthFactor>) -> Result<()> {
-
-    // }
-
+    // Withdraw deposited SOL from vault
    pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
+
+    add_interest_amount(
+        &ctx.accounts.vault_state,
+        &mut ctx.accounts.user_position,
+        &ctx.accounts.isol_token_mint.to_account_info(), 
+        &mut ctx.accounts.user_isol_token_account,
+        &ctx.accounts.token_program,
+        &ctx.accounts.vault_state.to_account_info(),
+    )?;
+
     let vault_state = &mut ctx.accounts.vault_state;
     let user_position = &mut ctx.accounts.user_position;
 
@@ -212,9 +311,7 @@ pub mod vaultix {
     );
     token::burn(burn_ctx, amount)?;
 
-    // Update user iSOL record
-    user_position.deposited_sol = user_position.deposited_sol.checked_sub(amount).unwrap();
-
+  
     // Transfer WSOL from vault to user
     let seeds = &[b"vault_state".as_ref(), vault_state.admin.as_ref(), &[vault_state.bump]];
     let signer = &[&seeds[..]];
@@ -235,6 +332,11 @@ pub mod vaultix {
         .deposited_sol
         .checked_sub(amount)
         .unwrap();
+
+    emit!(Withdrew{
+        user: user_position.user.key(),
+        amount: amount,
+    });
 
     Ok(())
 }
@@ -272,6 +374,27 @@ pub struct InitUserPosition<'info> {
     pub user: Signer<'info>,
     pub system_program: Program<'info, System>, 
 }
+
+// #[derive(Accounts)]
+// pub struct AddInterest<'info> {
+//     #[account(mut)]
+//     pub vault_state: Account<'info, VaultState>,
+
+//     #[account(mut)]
+//     pub user_position: Account<'info, UserPosition>,
+
+//     #[account( mut,
+//         address = vault_state.isol_token_mint, 
+//         mint::authority = vault_state,  )]
+//     pub isol_token_mint: Account<'info, Mint>,
+
+//     #[account(mut)]
+//     pub user_isol_token_account: Account<'info, TokenAccount>, // IB token account owned by user
+//     #[account(mut)]
+//     pub collateral_vault: Account<'info, TokenAccount>, // WSOL account owned by vault
+//     pub token_program: Program<'info, Token>,
+
+// }
 
 #[derive(Accounts)]
 pub struct DepositSol<'info> {
@@ -313,6 +436,10 @@ pub struct DepositSol<'info> {
 pub struct AddCollateral<'info> {
     #[account(mut)]
     pub user_position: Account<'info, UserPosition>,
+    #[account(mut)]
+    pub vault_state: Account<'info, VaultState>,
+    #[account(mut)]
+    pub isol_token_mint: Account<'info, Mint>, 
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(mut)]
@@ -358,6 +485,10 @@ pub struct RepaySol<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
     #[account(mut)]
+    pub isol_token_mint: Account<'info, Mint>, // IB token mint
+    #[account(mut)]
+    pub user_isol_token_account: Account<'info, TokenAccount>, // IB token account owned by user
+    #[account(mut)]
     pub user_wsol_account: Account<'info, TokenAccount>, // WSOL account owned
     #[account(mut)]
     pub collateral_vault: Account<'info, TokenAccount>, // WSOL account owned by vault
@@ -370,6 +501,8 @@ pub struct Liquidate<'info> {
     pub vault_state: Account<'info, VaultState>,
     #[account(mut)]
     pub user_position: Account<'info, UserPosition>,
+    #[account(mut)]
+    pub isol_token_mint: Account<'info, Mint>, // IB token mint
     #[account(mut)]
     pub user_isol_token_account: Account<'info, TokenAccount>, // IB token account owned by user
     #[account(mut)]
@@ -422,7 +555,7 @@ pub struct VaultState {
 // space = 8 + 32 + 8 + 8 + 8 + 8 + 1
 pub struct UserPosition {
     pub user: Pubkey,
-    pub deposited_sol: u64,
+    pub deposited_sol: u64, //This is the same as amount of iSOL as it is issued in 1:1 ratio
     pub borrowed_sol: u64,
     pub collateralized_isol_tokens: u64, //interest-bearing tokens
     pub last_borrowed_timestamp: i64,
@@ -437,12 +570,139 @@ pub enum ErrorCode {
     NothingToRepay,
     #[msg("Cannot withdraw collateral")]
     CannotWithdrawCollateral,
+    #[msg("Invalid mint")]
+    InvalidMint,
 }
 
+#[event]
+pub struct CreateVault{
+    pub admin: Pubkey,
+    pub collateral_vault: Pubkey,
+    pub isol_token_mint: Pubkey,
+    pub interest_rate: u64, 
+    pub debt_interest_rate: u64, 
+    pub liquidation_threshold: u64, 
+}
+
+#[event]
+pub struct Deposit{
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct CollateralAdded{
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct BorrowedSol{
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct Repayed{
+    pub user: Pubkey,
+    pub amount: u64,
+}
+
+#[event]
+pub struct Liquidated{
+    pub user: Pubkey,
+    pub amount: u64, // Amount repaid
+}
+
+#[event]
+pub struct Withdrew{
+    pub user: Pubkey,
+    pub amount: u64,
+}
 
 // Remember to make the vault_state as the authority for the IB token mint
 
+// // Helper function to calculate health factor
 pub fn get_health_factor(collateral: u64, borrowed: u64, liquidation_threshold: u64, interest_rate: u64) -> f64 {
-    (collateral as f64 * liquidation_threshold as f64) /
+    (collateral as f64 * (liquidation_threshold as f64 /100.0)) /
     (borrowed as f64 * (1.0 + interest_rate as f64 / 100.0))
+}
+
+// Helper function that calculates and adds interest and debt interest to user_position
+pub fn add_interest_amount<'info>(
+    vault_state: &VaultState,
+    user_position: &mut UserPosition,
+    isol_token_mint_info: &AccountInfo<'info>, // Change to AccountInfo instead of Pubkey
+    user_isol_token_account: &mut Account<'info, TokenAccount>,
+    token_program: &Program<'info, Token>,
+    vault_state_account_info: &AccountInfo<'info>,
+) -> Result<()> {
+    // Verify the mint matches what's stored in vault_state
+    require!(
+        isol_token_mint_info.key() == vault_state.isol_token_mint,
+        ErrorCode::InvalidMint
+    );
+
+    let last_timestamp = user_position.last_borrowed_timestamp;
+    let now = Clock::get()?.unix_timestamp;
+    let interest_rate = vault_state.interest_rate;
+    let seconds_in_year = 365 * 24 * 60 * 60;
+    let time_elapsed = (now - last_timestamp) as u64;
+    
+    let interest_earned = (user_position.deposited_sol as u128)
+        .checked_mul(interest_rate as u128)
+        .unwrap()
+        .checked_mul(time_elapsed as u128)
+        .unwrap()
+        .checked_div(seconds_in_year as u128)
+        .unwrap()
+        .checked_div(100u128)
+        .unwrap() as u64;
+
+    // Create signer seeds
+    let seeds = &[
+        b"vault_state".as_ref(), 
+        vault_state.admin.as_ref(), 
+        &[vault_state.bump]
+    ];
+    let signer = &[&seeds[..]];
+    
+    // Mint interest tokens to user
+    let cpi_accounts = MintTo {
+        mint: isol_token_mint_info.clone(), // Use the passed AccountInfo
+        to: user_isol_token_account.to_account_info(),
+        authority: vault_state_account_info.clone(),
+    };
+    let cpi_program = token_program.to_account_info();
+    let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+    
+    token::mint_to(cpi_ctx, interest_earned)?;
+
+    // Update user position
+    user_position.last_borrowed_timestamp = now;
+    user_position.deposited_sol = user_position
+        .deposited_sol
+        .checked_add(interest_earned)
+        .unwrap();
+
+    // Check for interest on borrowed SOL
+    let borrowed_sol = user_position.borrowed_sol;
+    if borrowed_sol != 0 {
+    let debt_interest_rate = vault_state.debt_interest_rate;
+    let debt_interest_earned = (borrowed_sol as u128)
+        .checked_mul(debt_interest_rate as u128)
+        .unwrap()
+        .checked_mul(time_elapsed as u128)
+        .unwrap()
+        .checked_div(seconds_in_year as u128)
+        .unwrap()
+        .checked_div(100u128)
+        .unwrap() as u64;
+
+    // Add to borrowed SOL
+    user_position.borrowed_sol = user_position
+        .borrowed_sol
+        .checked_add(debt_interest_earned).unwrap();
+}
+    Ok(())
 }
