@@ -4,7 +4,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer, Burn, MintTo};
 use anchor_spl::associated_token::AssociatedToken;
-
+use pyth_sdk_solana::{load_price_feed_from_account_info};
 
 declare_id!("6T71uU76fpMr6EBUJqjwT4T3wmuQpzj8QxnnEVv4T8cc");
 
@@ -241,6 +241,16 @@ pub mod vaultix {
         &ctx.accounts.vault_state.to_account_info(),
     )?;
 
+        // To set the pyth feed to give the price of SOLUSD
+        let expected_price_pubkey = "F7RyxQh3n1LDe5zHfjvE44aN7dXP3QWW3Gbn7b2ekVY6"
+        .parse::<Pubkey>()
+        .unwrap();
+
+    require!(
+        ctx.accounts.pyth_price_account.key() == expected_price_pubkey,
+        ErrorCode::InvalidPriceFeed
+    );
+
         let vault_state = &mut ctx.accounts.vault_state;
         let user_position = &mut ctx.accounts.user_position;
 
@@ -252,7 +262,7 @@ pub mod vaultix {
         let liquidation_threshold = vault_state.liquidation_threshold;
         
         // Calculate health factor
-        let health_factor = get_health_factor(collateralized_isol_tokens, borrowed_sol, liquidation_threshold, interest_rate);
+        let health_factor = get_health_factor(collateralized_isol_tokens, borrowed_sol, liquidation_threshold, interest_rate, &ctx.accounts.pyth_price_account)?;
 
         if health_factor < 1.0 {
             let amt_to_repay = (borrowed_sol as f64 * (1.0 + interest_rate as f64 / 100.0)) as u64; 
@@ -270,7 +280,7 @@ pub mod vaultix {
             
         emit!(Liquidated{
             user: user_position.user,
-            amount: amt_to_repay,
+            amount: amt_to_repay ,
         });
         }
 
@@ -375,26 +385,6 @@ pub struct InitUserPosition<'info> {
     pub system_program: Program<'info, System>, 
 }
 
-// #[derive(Accounts)]
-// pub struct AddInterest<'info> {
-//     #[account(mut)]
-//     pub vault_state: Account<'info, VaultState>,
-
-//     #[account(mut)]
-//     pub user_position: Account<'info, UserPosition>,
-
-//     #[account( mut,
-//         address = vault_state.isol_token_mint, 
-//         mint::authority = vault_state,  )]
-//     pub isol_token_mint: Account<'info, Mint>,
-
-//     #[account(mut)]
-//     pub user_isol_token_account: Account<'info, TokenAccount>, // IB token account owned by user
-//     #[account(mut)]
-//     pub collateral_vault: Account<'info, TokenAccount>, // WSOL account owned by vault
-//     pub token_program: Program<'info, Token>,
-
-// }
 
 #[derive(Accounts)]
 pub struct DepositSol<'info> {
@@ -508,6 +498,8 @@ pub struct Liquidate<'info> {
     #[account(mut)]
     pub collateral_vault: Account<'info, TokenAccount>, // WSOL account owned by vault
     pub token_program: Program<'info, Token>,
+    #[account(mut)]
+    pub pyth_price_account: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -535,7 +527,6 @@ pub struct Withdraw<'info> {
 
     pub token_program: Program<'info, Token>,
 }
-
 
 #[account]
 // space = 8 + 32 + 32 + 32 + 8 + 8 + 8 + 8 + 8 + 1
@@ -572,6 +563,8 @@ pub enum ErrorCode {
     CannotWithdrawCollateral,
     #[msg("Invalid mint")]
     InvalidMint,
+    #[msg("Invalid price feed")]
+    InvalidPriceFeed,
 }
 
 #[event]
@@ -623,10 +616,18 @@ pub struct Withdrew{
 // Remember to make the vault_state as the authority for the IB token mint
 
 // // Helper function to calculate health factor
-pub fn get_health_factor(collateral: u64, borrowed: u64, liquidation_threshold: u64, interest_rate: u64) -> f64 {
-    (collateral as f64 * (liquidation_threshold as f64 /100.0)) /
-    (borrowed as f64 * (1.0 + interest_rate as f64 / 100.0))
-}
+pub fn get_health_factor(collateral: u64, borrowed: u64, liquidation_threshold: u64, interest_rate: u64, price_account_info: &AccountInfo) -> Result<f64> {
+    
+     // Fetch the current price of SOL from Pyth or any other oracle
+    let now = Clock::get()?.unix_timestamp;
+    let price_feed = load_price_feed_from_account_info( price_account_info ).unwrap();
+    let current_price = price_feed.get_price_no_older_than(now, 60).unwrap();
+    let current_price = (current_price.price) as u64;  
+
+
+    let health_factor = (collateral as f64 *current_price as f64 * (liquidation_threshold as f64 /100.0)) /
+    (borrowed as f64 * (current_price as f64) * (1.0 + interest_rate as f64 / 100.0));
+    Ok(health_factor)}
 
 // Helper function that calculates and adds interest and debt interest to user_position
 pub fn add_interest_amount<'info>(
@@ -648,7 +649,7 @@ pub fn add_interest_amount<'info>(
     let interest_rate = vault_state.interest_rate;
     let seconds_in_year = 365 * 24 * 60 * 60;
     let time_elapsed = (now - last_timestamp) as u64;
-    
+       
     let interest_earned = (user_position.deposited_sol as u128)
         .checked_mul(interest_rate as u128)
         .unwrap()
